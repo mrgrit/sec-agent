@@ -1,3 +1,5 @@
+from app.services.llm_gateway.ollama import OllamaClient
+from app.services.llm_gateway.openai import OpenAIClient
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -12,16 +14,6 @@ from app.schemas import (
     KBSearchReq,
     LLMConnCreate, LLMConnOut, LLMSelectModel
 )
-from app.core.config import settings
-from app.services.rag_simple import chunk_text, bm25_search
-from pathlib import Path
-from datetime import datetime
-import json
-from redis import Redis
-from rq import Queue
-from app.worker.jobs import run_task as run_task_job
-from app.services.agent.state_machine import build_suricata_ids_plan
-from app.services.tools.ssh_tool import SSHRunner
 
 router = APIRouter()
 
@@ -128,21 +120,69 @@ def upsert_requirement(project_id: int, payload: RequirementUpsert):
 
 # -------- Clarify (MVP: rule-based placeholder) --------
 @router.post("/projects/{project_id}/agent/clarify")
-def clarify(project_id: int):
+def clarify(project_id: int, conn_id: int):
+    """
+    query param: conn_id (선택한 LLMConnection)
+    """
     db: Session = SessionLocal()
     try:
         req = db.query(Requirement).filter(Requirement.project_id == project_id).order_by(Requirement.id.desc()).first()
         if not req:
             raise HTTPException(400, "no requirement")
-        questions = []
+
+        # target이 없으면 먼저 target부터 물어보는 건 그대로 유지
         if not req.target_id:
-            questions.append({"field": "target_id", "question": "대상 서버(target)를 선택해줘."})
-        # MVP: Suricata만, interface/home_net은 자동 추정 후 plan에서 보여줌
-        done = len(questions) == 0
-        return {"done": done, "questions": questions}
+            return {"done": False, "questions": [{"field": "target_id", "question": "대상 서버(target)를 선택해줘."}]}
+
+        # structured 누적
+        structured = req.structured or {}
+        requirement_text = req.text
+
+        system = """너는 보안시스템 설치/운영 에이전트다.
+사용자 요구사항을 실행 가능한 형태로 만들기 위해, 부족한 정보만 질문한다.
+질문은 반드시 JSON으로만 출력한다.
+형식:
+{
+  "done": true|false,
+  "questions": [
+     {"field": "...", "question": "...", "type": "text|select", "options": ["..."] }
+  ],
+  "assumptions": { ... }
+}
+주의:
+- 이미 structured에 값이 있으면 다시 묻지 않는다.
+- 질문은 최대 5개만 만든다.
+"""
+
+        user = {
+            "requirement": requirement_text,
+            "structured": structured,
+            "needed_fields": ["mode", "iface", "home_net", "rule_source", "maintenance_policy"],
+            "defaults": {
+                "mode": "IDS",
+                "rule_source": "ET Open",
+                "maintenance_policy": "rules update daily, keep logs 7 days"
+            }
+        }
+
+        client = get_llm_client(db, conn_id)
+        content = client.chat(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user, ensure_ascii=False)}
+            ],
+            timeout_s=900,
+        )
+
+        # JSON 파싱(실패하면 안전하게 fallback)
+        try:
+            out = json.loads(content)
+        except Exception:
+            out = {"done": False, "questions": [{"field": "mode", "question": "IDS로 진행할까 IPS로 진행할까?", "type": "select", "options": ["IDS", "IPS"]}]}
+
+        return out
     finally:
         db.close()
-
 
 # -------- Plan --------
 @router.post("/projects/{project_id}/agent/plan", response_model=PlanOut)
@@ -388,5 +428,93 @@ def llm_select(conn_id: int, payload: LLMSelectModel):
         c.timeout_s = payload.timeout_s
         db.commit()
         return {"ok": True}
+    finally:
+        db.close()
+
+def get_llm_client(db: Session, conn_id: int):
+    c = db.query(LLMConnection).filter(LLMConnection.id == conn_id).first()
+    if not c:
+        raise HTTPException(404, "llm connection not found")
+    if not c.selected_model:
+        raise HTTPException(400, "selected_model is empty. call /llm/{id}/select first")
+
+    if c.type == "ollama":
+        if not c.base_url:
+            raise HTTPException(400, "ollama base_url missing")
+        return OllamaClient(base_url=c.base_url, model=c.selected_model)
+
+    if c.type == "openai":
+        if not c.enc_api_key:
+            raise HTTPException(400, "openai api_key missing")
+        api_key = decrypt_text(c.enc_api_key)
+        return OpenAIClient(api_key=api_key, model=c.selected_model)
+
+    raise HTTPException(400, f"unknown llm type: {c.type}")
+
+@router.get("/llm/{conn_id}/models")
+def llm_models(conn_id: int):
+    db: Session = SessionLocal()
+    try:
+        c = db.query(LLMConnection).filter(LLMConnection.id == conn_id).first()
+        if not c:
+            raise HTTPException(404, "not found")
+        if c.type != "ollama":
+            # MVP: openai는 고정 모델만 반환
+            return {"models": [c.selected_model] if c.selected_model else []}
+        if not c.base_url:
+            raise HTTPException(400, "base_url missing")
+
+        tmp = OllamaClient(base_url=c.base_url, model=c.selected_model or "llama3")
+        return {"models": tmp.list_models()}
+    finally:
+        db.close()
+
+
+@router.post("/llm/{conn_id}/chat")
+def llm_chat(conn_id: int, payload: dict):
+    """
+    payload example:
+    {
+      "messages": [{"role":"system","content":"..."},{"role":"user","content":"..."}],
+      "timeout_s": 600
+    }
+    """
+    db: Session = SessionLocal()
+    try:
+        timeout_s = int(payload.get("timeout_s", 600))
+        messages = payload.get("messages", [])
+        if not isinstance(messages, list) or not messages:
+            raise HTTPException(400, "messages must be a non-empty list")
+
+        client = get_llm_client(db, conn_id)
+        text = client.chat(messages=messages, timeout_s=timeout_s)
+        return {"content": text}
+    finally:
+        db.close()
+
+@router.post("/projects/{project_id}/agent/clarify/answer")
+def clarify_answer(project_id: int, payload: dict):
+    """
+    payload example:
+    {
+      "updates": {"mode":"IDS","iface":"ens160","home_net":"[10.0.0.0/8]"}
+    }
+    """
+    db: Session = SessionLocal()
+    try:
+        req = db.query(Requirement).filter(Requirement.project_id == project_id).order_by(Requirement.id.desc()).first()
+        if not req:
+            raise HTTPException(400, "no requirement")
+
+        updates = payload.get("updates", {})
+        if not isinstance(updates, dict) or not updates:
+            raise HTTPException(400, "updates must be non-empty dict")
+
+        structured = req.structured or {}
+        structured.update(updates)
+        req.structured = structured
+        db.commit()
+
+        return {"ok": True, "structured": req.structured}
     finally:
         db.close()

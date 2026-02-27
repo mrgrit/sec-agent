@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir -U pip && \
       redis==5.2.1 rq==2.1.0 \
       paramiko==3.5.0 \
       python-multipart==0.0.20 \
-      cryptography==44.0.0
+      cryptography==44.0.0 \
+      httpx==0.27.2
 
 COPY app /app/app
 

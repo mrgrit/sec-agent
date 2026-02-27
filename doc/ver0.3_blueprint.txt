@@ -1,0 +1,131 @@
+응, 그 “목적을 이루기 위해 오가는 프롬프트(내부 대화/리트라이/툴 호출 유도)” 쪽은 **OpenClaw가 확실히 배울 게 많아.**
+특히 네가 말한 **Execute(실행) 구간**에서, OpenClaw 스타일을 가져오면 sec-agent가 “그럴싸한 채팅앱”이 아니라 **진짜 작업 자동화 엔진**으로 업그레이드됨.
+
+아래는 **OpenClaw에서 배워서 sec-agent에 바로 적용할 만한 것들(핵심 7가지)**이야.
+
+---
+
+## 1) 툴을 “두 채널”로 노출하는 방식
+
+OpenClaw는 툴을 **(1) 시스템 프롬프트 텍스트** + **(2) 툴 스키마(함수 정의)** 두 방식으로 동시에 보여준다고 문서에 명시돼 있어. 이게 툴 호출 안정성에 엄청 영향 줌. ([OpenClaw][1])
+
+**sec-agent 적용**
+
+* 지금은 “SSH 실행/파일쓰기/systemd” 같은 툴을 코드로만 갖고 있는데,
+* LLM에게는 **툴 목록/용도/금지 규칙을 시스템 프롬프트에 ‘사람말’로도** 보여주고,
+* 동시에 function schema(혹은 JSON tool spec)도 같이 전달.
+* → 오픈모델에서 **툴 호출 실패율 확 떨어짐**(특히 Ollama 계열).
+
+---
+
+## 2) “모델별 프롬프트 템플릿/툴 호출 포맷 어댑터”
+
+OpenClaw 이슈에서도 “모델마다 툴 호출 포맷이 다르니 **모델별 템플릿** 또는 **어댑터 레이어**가 필요”하다고 얘기해. ([GitHub][2])
+
+**sec-agent 적용**
+
+* `LLMConnection`에 `tool_format`(예: `openai_json`, `llama_python_tag`, `qwen_json`) 같은 필드 추가
+* 출력이 안 맞으면 “정규화 어댑터”에서 통일된 내부 포맷으로 변환
+* → 같은 플랜/툴이라도 모델 바꿔도 안정적으로 동작.
+
+---
+
+## 3) “Attempt(시도) 단위” 실행 + 자동 Retry 제어
+
+OpenClaw 내부에서 retry 처리와 tool-call 동기화가 핵심 이슈로 계속 다뤄져(툴이 끝나기 전에 retry가 끝나는 버그 등). 이건 역설적으로 “Attempt/Retry 구조가 엔진의 핵심”이라는 뜻이야. ([GitHub][3])
+
+**sec-agent 적용**
+
+* 지금은 “TODO 실행 → 실패 시 NEEDS_INPUT” 중심인데,
+* v0.3에서 **Attempt 엔티티**(task_attempts 테이블) 추가 추천:
+
+  * attempt마다: 입력 프롬프트, 실행 스크립트, 증빙, 결과, 실패 원인, 다음 패치
+* Retry 정책을 명시적으로:
+
+  * `retry_limit`, `retry_backoff`, `retry_only_on`(예: 네트워크/패키지/경로 오류만)
+* → “왜 재시도했는지”가 감사 가능해짐.
+
+---
+
+## 4) “이벤트 로그/라이프사이클 트래킹”을 1급 시민으로
+
+OpenClaw는 세션/런타임/툴 실행을 관측하고 디버깅하는 걸 강조해(레포 소개에서도 tools/sessions/logging 같은 런타임 기능이 전면에 있음). ([GitHub][4])
+
+**sec-agent 적용**
+
+* 지금 SSE 로그는 잘했는데, 다음은 “구조화 이벤트”가 필요:
+
+  * `STEP_STARTED`, `TOOL_CALLED`, `TOOL_RESULT`, `VERIFY_PASS`, `VERIFY_FAIL`, `PATCH_APPLIED`
+* UI도 단순 로그창 말고 “타임라인”으로
+* → 운영 자동화 제품 느낌이 확 남.
+
+---
+
+## 5) “정책(Policy) 기반 안전장치”를 텍스트로 선언
+
+최근 에이전트 보안 논의에서 “사용자 정의 정책을 룰로 변환해 강제”하는 접근이 강조돼. ([WIRED][5])
+(OpenClaw도 ‘실행하는 에이전트’라서 안전/격리 이야기가 많이 붙는 흐름이 있음. ([TechRadar][6]))
+
+**sec-agent 적용**
+
+* 정책을 코드가 아니라 **간단한 DSL/YAML**로:
+
+  * “방화벽/IPS 관련 명령은 금지(또는 2단계 승인)”
+  * “/etc 이외 경로 쓰기 금지”
+  * “sudo는 특정 명령만 허용”
+* 정책은 **실행 전/툴 호출 전**에 항상 검증
+* → 실무에서 신뢰도가 올라감.
+
+---
+
+## 6) “Skills/도구의 공급망 보안” 관점
+
+OpenClaw가 “스킬/도구”를 확장하는 생태계를 강조하고, 보안/검증 파트너십까지 언급하는 흐름이 있어. ([OpenClaw][7])
+
+**sec-agent 적용**
+
+* sec-agent도 곧 Suricata/ModSecurity/OPNsense 플러그인(스킬) 늘어날 텐데,
+* “스킬 등록” 시:
+
+  * 실행 명령 목록
+  * 필요한 권한
+  * 변경 파일 패턴
+  * 테스트케이스
+    를 메타데이터로 강제하면, 스킬이 커져도 관리 가능.
+
+---
+
+## 7) “Live workspace(작업 캔버스)” 개념을 작은 형태로 도입
+
+OpenClaw는 캔버스/노드/세션 같은 “작업 공간”을 기능으로 내세워. ([GitHub][4])
+
+**sec-agent 적용(가볍게)**
+
+* 당장 캔버스까지는 과하고,
+* v0.3에 “작업 노트(Plan/가정/결정/리스크)”를 UI에 고정 패널로 두기
+* 채팅은 그 노트를 업데이트하거나 TODO를 수정하는 **액션**으로 연결
+* → “챗봇 UI”에서 “작업 운영 UI”로 바뀜.
+
+---
+
+# 너가 딱 원하는 “Execute 단계”에 OpenClaw식으로 바로 넣을 3개
+
+1. **Attempt/Retry 프롬프트 템플릿**(실패 로그 + RAG 근거 + 수정 패치 생성)
+2. **Tool dual-channel 노출**(툴 목록을 시스템 프롬프트에도, 스키마에도) ([OpenClaw][1])
+3. **모델별 tool-format 어댑터**(qwen/llama/openai 포맷 차이 흡수) ([GitHub][2])
+
+---
+
+원하면 다음 메시지에서,
+
+* sec-agent의 **Execute 루프를 OpenClaw 스타일(Attempt/Retry/Tool adapter/Policy)**로 바꾸는 **v0.3 설계 + DB 스키마 + 프롬프트 템플릿(실패/패치/검증)**
+  를 “바로 코드로 옮길 수 있게” 한 세트로 만들어줄게.
+
+[1]: https://docs.openclaw.ai/tools?utm_source=chatgpt.com "Tools"
+[2]: https://github.com/openclaw/openclaw/issues/6049?utm_source=chatgpt.com "Support for Ollama/Llama models with different tool-calling ..."
+[3]: https://github.com/openclaw/openclaw/issues/13748?utm_source=chatgpt.com "bug: pi-agent-core _resolveRetry() fires before tool ..."
+[4]: https://github.com/openclaw/openclaw?utm_source=chatgpt.com "openclaw/openclaw: Your own personal AI assistant. Any ..."
+[5]: https://www.wired.com/story/ironcurtain-ai-agent-security?utm_source=chatgpt.com "This AI Agent Is Designed to Not Go Rogue"
+[6]: https://www.techradar.com/pro/security/microsoft-says-openclaw-is-unsuited-to-run-on-standard-personal-or-enterprise-workstation-so-should-you-be-worried?utm_source=chatgpt.com "Microsoft says OpenClaw is \"not appropriate to run on a standard personal or enterprise workstation\" - so should you be worried?"
+[7]: https://openclaw.ai/?utm_source=chatgpt.com "OpenClaw — Personal AI Assistant"
+
